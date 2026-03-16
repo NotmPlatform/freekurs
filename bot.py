@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/web3_course.db")
-MIN_LESSON_MINUTES = int(os.getenv("MIN_LESSON_MINUTES", "5"))
+MIN_LESSON_MINUTES = int(os.getenv("MIN_LESSON_MINUTES", "3"))
 PROF_TEST_URL = os.getenv("PROF_TEST_URL", "https://t.me/Web3UPbot")
 BONUS_TEXT_URL = os.getenv("BONUS_TEXT_URL", "")
 BONUS_VIDEO_URL = os.getenv("BONUS_VIDEO_URL", "")
@@ -479,6 +479,12 @@ def format_duration(seconds: int) -> str:
     return f"{minutes} мин. {secs} сек."
 
 
+def format_mmss(seconds: int) -> str:
+    minutes = seconds // 60
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
 
 def safe_username(user) -> str:
     return f"@{html.escape(user.username)}" if user.username else "не указан"
@@ -543,31 +549,50 @@ def lesson_status_lines(user_id: int, lesson_number: int) -> str:
 
 
 
-def lesson_keyboard(lesson_number: int) -> InlineKeyboardMarkup:
+def lesson_keyboard(user_id: int, lesson_number: int) -> InlineKeyboardMarkup:
     lesson = LESSONS[lesson_number - 1]
+    lesson_row = get_user_lesson(user_id, lesson_number)
+    text_url = bool(lesson["text_url"])
+    video_url = bool(lesson["video_url"])
+    any_format = text_url or video_url
+    opened = lesson_was_opened(user_id, lesson_number)
+    completed = bool(lesson_row and lesson_row["completed_at"])
+
     buttons = []
 
     format_row = []
-    if lesson["text_url"]:
+    if text_url:
         format_row.append(InlineKeyboardButton("📖 Текстовый урок", callback_data=f"open_text:{lesson_number}"))
-    if lesson["video_url"]:
+    if video_url:
         format_row.append(InlineKeyboardButton("🎬 Видео урок", callback_data=f"open_video:{lesson_number}"))
     if format_row:
         buttons.append(format_row)
 
-    buttons.append([InlineKeyboardButton("✅ Я изучил урок", callback_data=f"done:{lesson_number}")])
-    buttons.append(
-        [
-            InlineKeyboardButton("✍️ Написать, что понял", callback_data=f"reflect:{lesson_number}:same"),
-            InlineKeyboardButton("❓ Задать вопрос", callback_data=f"question:{lesson_number}"),
-        ]
-    )
+    if not any_format:
+        buttons.append([InlineKeyboardButton("🔒 Урок скоро будет доступен", callback_data=f"locked:{lesson_number}")])
+    elif completed:
+        buttons.append([InlineKeyboardButton("✅ Урок завершён", callback_data=f"done:{lesson_number}")])
+    elif not opened:
+        buttons.append([InlineKeyboardButton("⏳ Сначала откройте урок", callback_data=f"locked:{lesson_number}")])
+    elif can_open_next_without_reflection(user_id, lesson_number):
+        buttons.append([InlineKeyboardButton("✅ Я изучил урок", callback_data=f"done:{lesson_number}")])
+    else:
+        remaining = remaining_seconds_to_unlock(user_id, lesson_number)
+        buttons.append([InlineKeyboardButton(f"⏳ До перехода: {format_mmss(remaining)}", callback_data=f"locked:{lesson_number}")])
+
+    if any_format:
+        next_step = "finish" if lesson_number >= len(LESSONS) else "next"
+        secondary_row = [InlineKeyboardButton("✍️ Что понял", callback_data=f"reflect:{lesson_number}:{next_step}")]
+        if ADMIN_GROUP_ID:
+            secondary_row.append(InlineKeyboardButton("❓ Вопрос", callback_data=f"question:{lesson_number}"))
+        buttons.append(secondary_row)
+    elif ADMIN_GROUP_ID:
+        buttons.append([InlineKeyboardButton("❓ Вопрос", callback_data=f"question:{lesson_number}")])
 
     if lesson_number == 3 and COMMUNITY_URL:
-        buttons.append([InlineKeyboardButton("💬 Вступить в сообщество 2026up", url=COMMUNITY_URL)])
+        buttons.append([InlineKeyboardButton("💬 Вступить в 2026up", url=COMMUNITY_URL)])
 
     return InlineKeyboardMarkup(buttons)
-
 
 
 def open_link_keyboard(label: str, url: str) -> InlineKeyboardMarkup:
@@ -707,14 +732,21 @@ async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson
     status = lesson_status_lines(user.id, lesson_number)
     status_block = f"\n\n<b>Статус:</b>\n{status}" if status else ""
 
-    format_hint = "Выберите удобный формат: текст или видео." if lesson["text_url"] or lesson["video_url"] else "Материалы урока скоро будут добавлены."
+    has_any_format = bool(lesson["text_url"] or lesson["video_url"])
+    if has_any_format:
+        format_hint = (
+            f"Выберите удобный формат: текст или видео. Следующий урок откроется через {MIN_LESSON_MINUTES} "
+            f"мин. или раньше, если вы нажмёте <b>«✍️ Что понял»</b> и коротко напишете вывод."
+        )
+    else:
+        format_hint = "Материалы урока скоро будут добавлены."
 
     text = (
         f"<b>Урок {lesson_number} из {len(LESSONS)}</b>\n"
         f"<b>{html.escape(lesson['title'])}</b>\n\n"
         f"{html.escape(lesson['subtitle'])}\n\n"
         f"<b>Что внутри:</b>\n{bullets}\n\n"
-        f"{format_hint} После изучения нажмите <b>«✅ Я изучил урок»</b>.\n\n"
+        f"{format_hint}\n\n"
         f"<i>Рекомендуемое время на урок: от {MIN_LESSON_MINUTES} минут.</i>"
         f"{status_block}"
     )
@@ -723,11 +755,11 @@ async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson
         text += "\n\n💬 <b>Хотите не только проходить уроки, но и быть в среде?</b> Вступайте в 2026up."
 
     if update.callback_query:
-        await safe_edit_or_reply(update.callback_query, text, lesson_keyboard(lesson_number))
+        await safe_edit_or_reply(update.callback_query, text, lesson_keyboard(user.id, lesson_number))
     else:
         await update.effective_message.reply_text(
             text,
-            reply_markup=lesson_keyboard(lesson_number),
+            reply_markup=lesson_keyboard(user.id, lesson_number),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -828,10 +860,9 @@ async def ask_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE, les
     remaining = remaining_seconds_to_unlock(user.id, lesson_number)
 
     text = (
-        f"⏱ Вы уделили уроку <b>{format_duration(spent)}</b>.\n"
-        f"Для автоматического перехода нужно хотя бы <b>{MIN_LESSON_MINUTES} минут</b>.\n"
-        f"Осталось: <b>{format_duration(remaining)}</b>.\n\n"
-        "Чтобы перейти дальше сразу, коротко напишите, какую мысль вы забрали из урока."
+        f"⏱ С уроком прошло <b>{format_duration(spent)}</b>.\n"
+        f"До автоматического перехода осталось: <b>{format_mmss(remaining)}</b>.\n\n"
+        "Если хотите открыть следующий урок раньше, коротко напишите, какую мысль вы забрали из этого урока."
     )
 
     if update.callback_query:
@@ -865,15 +896,8 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, lesso
 
 
 async def send_lesson_link(query, label: str, url: str, lesson_number: int) -> None:
-    await query.message.reply_text(
-        (
-            f"{label} для урока <b>{lesson_number}</b>.\n"
-            "После изучения вернитесь к карточке урока и нажмите <b>«✅ Я изучил урок»</b>."
-        ),
-        reply_markup=open_link_keyboard(label, url),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    # Оставлено для совместимости, но в актуальном UX урок открывается сразу из callback.
+    await query.answer(url=url)
 
 
 # =========================
@@ -968,16 +992,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
         return
 
-    await query.answer()
     upsert_user(user.id, user.username or "", user.first_name or "")
     db_user = get_user(user.id)
     data = query.data or ""
 
     if data == "open_bonus_gate":
+        await query.answer()
         await send_bonus_gate(update, context)
         return
 
     if data == "open_bonus_confirmed":
+        await query.answer()
         await send_bonus_step(update, context)
         return
 
@@ -985,6 +1010,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         action, lesson_raw = data.split(":", 1)
         lesson_number = int(lesson_raw)
         if not db_user:
+            await query.answer()
             await send_lesson(update, context, 1)
             return
 
@@ -995,7 +1021,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         lesson = LESSONS[lesson_number - 1]
         url = lesson["text_url"] if action == "open_text" else lesson["video_url"]
-        label = "📖 Открыть текстовый урок" if action == "open_text" else "🎬 Открыть видео урок"
         if not url:
             await query.answer("Ссылка для этого формата ещё не добавлена.", show_alert=True)
             return
@@ -1014,15 +1039,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             update_user_lesson(user.id, lesson_number, started_at=started_at, opened_video_at=now_iso())
             log_event(user.id, "open_video", lesson_number, "first_open" if started_now else "repeat_open")
 
-        await send_lesson_link(query, label, url, lesson_number)
+        try:
+            await query.answer(url=url)
+        except Exception:
+            logger.exception("Не удалось открыть URL напрямую через callback")
+            await query.message.reply_text(
+                "Откройте урок по ссылке ниже и вернитесь сюда после изучения материала.",
+                reply_markup=open_link_keyboard("Открыть урок", url),
+                disable_web_page_preview=True,
+            )
         await send_lesson(update, context, lesson_number)
         return
 
-    if data.startswith("question:"):
+    if data.startswith("locked:"):
         lesson_number = int(data.split(":", 1)[1])
         if not db_user or int(db_user["current_lesson"] or 0) != lesson_number:
             await query.answer("Сначала откройте ваш текущий урок.", show_alert=True)
             return
+
+        lesson = LESSONS[lesson_number - 1]
+        if not (lesson["text_url"] or lesson["video_url"]):
+            await query.answer("Материалы этого урока ещё не добавлены.", show_alert=True)
+            return
+
+        if not lesson_was_opened(user.id, lesson_number):
+            await query.answer("Сначала откройте текстовый или видео-урок.", show_alert=True)
+            return
+
+        remaining = remaining_seconds_to_unlock(user.id, lesson_number)
+        await query.answer(
+            f"До открытия следующего урока осталось {format_mmss(remaining)}.\nИли нажмите «✍️ Что понял», чтобы перейти раньше.",
+            show_alert=True,
+        )
+        return
+
+    if data.startswith("question:"):
+        lesson_number = int(data.split(":", 1)[1])
+        if not ADMIN_GROUP_ID:
+            await query.answer("Кураторы пока не подключены.", show_alert=True)
+            return
+        if not db_user or int(db_user["current_lesson"] or 0) != lesson_number:
+            await query.answer("Сначала откройте ваш текущий урок.", show_alert=True)
+            return
+        await query.answer()
         await ask_question(update, context, lesson_number)
         return
 
@@ -1032,6 +1091,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not db_user or int(db_user["current_lesson"] or 0) != lesson_number:
             await query.answer("Сначала откройте ваш текущий урок.", show_alert=True)
             return
+        await query.answer()
         await ask_reflection(update, context, lesson_number, next_step)
         return
 
@@ -1068,9 +1128,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.message.reply_text("Отлично, двигаемся дальше. Открываю следующий урок.")
                 await send_lesson(update, context, lesson_number + 1)
         else:
-            next_step = "finish" if lesson_number >= len(LESSONS) else "next"
-            await ask_reflection(update, context, lesson_number, next_step)
+            remaining = remaining_seconds_to_unlock(user.id, lesson_number)
+            await query.answer(
+                f"До открытия следующего урока осталось {format_mmss(remaining)}.\nИли нажмите «✍️ Что понял», чтобы перейти раньше.",
+                show_alert=True,
+            )
         return
+
+
+    await query.answer()
 
 
 async def input_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
