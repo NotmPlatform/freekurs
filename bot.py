@@ -511,7 +511,8 @@ def lesson_seconds_spent(user_id: int, lesson_number: int) -> int:
 
 
 def can_open_next_without_reflection(user_id: int, lesson_number: int) -> bool:
-    if not lesson_was_opened(user_id, lesson_number):
+    lesson_row = get_user_lesson(user_id, lesson_number)
+    if not lesson_row or not lesson_row["started_at"]:
         return False
     return lesson_seconds_spent(user_id, lesson_number) >= MIN_LESSON_MINUTES * 60
 
@@ -530,23 +531,18 @@ def lesson_status_lines(user_id: int, lesson_number: int) -> str:
         return ""
 
     lines = []
-    if lesson_row["opened_text_at"]:
-        lines.append("✅ Текст открыт")
-    else:
-        lines.append("▫️ Текст ещё не открыт")
-
-    if lesson_row["opened_video_at"]:
-        lines.append("✅ Видео открыто")
-    else:
-        lines.append("▫️ Видео ещё не открыто")
-
     if lesson_row["completed_at"]:
         lines.append("✅ Урок отмечен как изученный")
     elif lesson_row["started_at"]:
-        lines.append(f"⏱ Прошло с первого открытия: {format_duration(lesson_seconds_spent(user_id, lesson_number))}")
+        spent = lesson_seconds_spent(user_id, lesson_number)
+        lines.append(f"⏱ Прошло с момента открытия урока: {format_duration(spent)}")
+        remaining = remaining_seconds_to_unlock(user_id, lesson_number)
+        if remaining > 0:
+            lines.append(f"⏳ До открытия следующего урока: {format_mmss(remaining)}")
+        else:
+            lines.append("✅ Следующий урок уже можно открыть")
 
-    return "\n".join(lines)
-
+        return "\n".join(lines)
 
 
 def lesson_keyboard(user_id: int, lesson_number: int) -> InlineKeyboardMarkup:
@@ -719,6 +715,10 @@ async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson
 
     upsert_user(user.id, user.username or "", user.first_name or "")
     ensure_lesson_row(user.id, lesson_number)
+    lesson_row = get_user_lesson(user.id, lesson_number)
+    has_any_format = bool(lesson["text_url"] or lesson["video_url"])
+    if has_any_format and lesson_row and not lesson_row["started_at"]:
+        update_user_lesson(user.id, lesson_number, started_at=now_iso())
     update_user_state(
         user.id,
         current_lesson=lesson_number,
@@ -732,10 +732,9 @@ async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson
     status = lesson_status_lines(user.id, lesson_number)
     status_block = f"\n\n<b>Статус:</b>\n{status}" if status else ""
 
-    has_any_format = bool(lesson["text_url"] or lesson["video_url"])
     if has_any_format:
         format_hint = (
-            f"Выберите удобный формат: текст или видео. Следующий урок откроется через {MIN_LESSON_MINUTES} "
+            f"Выберите удобный формат: текст или видео. Кнопка <b>«✅ Я изучил урок»</b> станет доступна через {MIN_LESSON_MINUTES} "
             f"мин. или раньше, если вы нажмёте <b>«✍️ Что понял»</b> и коротко напишете вывод."
         )
     else:
@@ -1062,10 +1061,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Материалы этого урока ещё не добавлены.", show_alert=True)
             return
 
-        if not lesson_was_opened(user.id, lesson_number):
-            await query.answer("Сначала откройте текстовый или видео-урок.", show_alert=True)
-            return
-
         remaining = remaining_seconds_to_unlock(user.id, lesson_number)
         await query.answer(
             f"До открытия следующего урока осталось {format_mmss(remaining)}.\nИли нажмите «✍️ Что понял», чтобы перейти раньше.",
@@ -1110,10 +1105,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lesson_row = get_user_lesson(user.id, lesson_number)
         if lesson_row and lesson_row["completed_at"]:
             await query.answer("Этот урок уже отмечен как изученный.", show_alert=True)
-            return
-
-        if not lesson_was_opened(user.id, lesson_number):
-            await query.answer("Сначала откройте текстовый или видео-урок.", show_alert=True)
             return
 
         if can_open_next_without_reflection(user.id, lesson_number):
