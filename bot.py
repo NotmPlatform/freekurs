@@ -64,6 +64,8 @@ BONUS_TEXT_URL = env_str("BONUS_TEXT_URL", "BONUS_LESSON_TEXT_URL")
 BONUS_VIDEO_URL = env_str("BONUS_VIDEO_URL", "BONUS_LESSON_VIDEO_URL")
 COMMUNITY_URL = env_str("COMMUNITY_URL", "GROUP_URL")
 CHANNEL_URL = env_str("CHANNEL_URL")
+BONUS_TITLE = env_str("BONUS_TITLE", default="Ваш карьерный навигатор по Web3")
+ADMIN_USER_IDS = {int(x) for x in env_str("ADMIN_USER_IDS").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}
 WEBHOOK_URL = env_str("WEBHOOK_URL").rstrip("/")
 WEBHOOK_PATH = env_str("WEBHOOK_PATH", default="webhook").strip("/") or "webhook"
 WEBHOOK_SECRET = env_str("WEBHOOK_SECRET")
@@ -165,7 +167,8 @@ HELP_TEXT = (
     "ℹ️ <b>Как пользоваться ботом</b>\n\n"
     "• открывайте урок в тексте или видео;\n"
     "• листайте курс кнопками <b>⬅️ Назад</b> и <b>➡️ Дальше</b>;\n"
-    "• в конце пройдите тест и откройте бонус.\n\n"
+    "• после 7 урока обязательно пройдите тест на выбор профессии;\n"
+    "• затем откройте бонус.\n\n"
     "<b>Важно:</b> бонус открывается только после подписки на канал и вступления в группу."
 )
 
@@ -315,11 +318,14 @@ def get_lesson(number: int) -> dict:
 def build_lesson_text(lesson_number: int) -> str:
     lesson = get_lesson(lesson_number)
     bullets = "\n".join(f"• {item}" for item in lesson["bullets"])
+    extra = ""
+    if not lesson.get("text_url") and not lesson.get("video_url"):
+        extra = "\n\n<i>Материал этого урока скоро будет добавлен.</i>"
     return (
         f"<b>Урок {lesson_number} из {TOTAL_LESSONS}</b>\n"
         f"<b>{lesson['title']}</b>\n\n"
         f"{lesson['subtitle']}\n\n"
-        f"<b>Что внутри:</b>\n{bullets}"
+        f"<b>Что внутри:</b>\n{bullets}{extra}"
     )
 
 
@@ -350,18 +356,20 @@ def lesson_keyboard(lesson_number: int) -> InlineKeyboardMarkup:
 def final_text() -> str:
     return (
         "<b>Курс завершён 🚀</b>\n\n"
-        "Вы прошли все 7 уроков и уже понимаете базу Web3, роли в индустрии и возможные точки входа.\n\n"
-        "<b>Что дальше:</b>\n"
-        "• пройдите тест на профессию в Web3;\n"
-        "• подпишитесь на канал и вступите в группу;\n"
-        "• после проверки откройте бонусный урок."
+        "Вы уже разобрались в базе Web3, увидели роли в индустрии и поняли, какие точки входа реально существуют.\n\n"
+        "<b>Главный следующий шаг — пройти тест на выбор профессии.</b>\n"
+        "Именно он поможет вам не распыляться, а выбрать своё направление в Web3 и понять, куда двигаться дальше.\n\n"
+        "<b>После теста:</b>\n"
+        "• подпишитесь на канал;\n"
+        "• вступите в группу;\n"
+        f"• откройте бонус: <b>{BONUS_TITLE}</b>."
     )
 
 
 def final_keyboard() -> InlineKeyboardMarkup:
     rows = []
     if PROF_TEST_URL:
-        rows.append([InlineKeyboardButton("🧭 Пройти тест", url=PROF_TEST_URL)])
+        rows.append([InlineKeyboardButton("🎯 Выбрать профессию в Web3", url=PROF_TEST_URL)])
 
     join_row = []
     if COMMUNITY_URL:
@@ -371,7 +379,7 @@ def final_keyboard() -> InlineKeyboardMarkup:
     if join_row:
         rows.append(join_row)
 
-    rows.append([InlineKeyboardButton("✅ Проверить подписку и открыть бонус", callback_data="bonus:check")])
+    rows.append([InlineKeyboardButton("🎁 Открыть бонус после подписки", callback_data="bonus:check")])
     rows.append([InlineKeyboardButton("⬅️ К уроку 7", callback_data="lesson:7")])
     return InlineKeyboardMarkup(rows)
 
@@ -385,14 +393,16 @@ def locked_bonus_text(missing_channel: bool, missing_group: bool) -> str:
     missing_text = "\n".join(missing) or "• выполните условия доступа"
     return (
         "<b>Бонус пока закрыт</b>\n\n"
-        "Чтобы открыть бонусный урок, нужно выполнить оба условия:\n"
+        f"Чтобы открыть <b>{BONUS_TITLE}</b>, нужно выполнить оба условия:\n"
         f"{missing_text}\n\n"
-        "После этого нажмите <b>«Проверить снова»</b>."
+        "<b>Главный шаг всё равно остаётся прежним:</b> сначала пройдите тест на выбор профессии, затем откройте бонус."
     )
 
 
 def locked_bonus_keyboard(missing_channel: bool, missing_group: bool) -> InlineKeyboardMarkup:
     rows = []
+    if PROF_TEST_URL:
+        rows.append([InlineKeyboardButton("🎯 Выбрать профессию в Web3", url=PROF_TEST_URL)])
     join_row = []
     if missing_group and COMMUNITY_URL:
         join_row.append(InlineKeyboardButton("💬 Вступить в группу", url=COMMUNITY_URL))
@@ -407,18 +417,21 @@ def locked_bonus_keyboard(missing_channel: bool, missing_group: bool) -> InlineK
 
 def bonus_text() -> str:
     return (
-        "<b>Бонус открыт 🎁</b>\n\n"
-        "Вы выполнили условия доступа. Ниже — бонусный урок по карьерной навигации в Web3."
+        f"<b>Бонус открыт: {BONUS_TITLE}</b> 🎁\n\n"
+        "Вы выполнили условия доступа. Ниже — бонусный материал, который поможет закрепить курс.\n\n"
+        "<b>Но главный следующий шаг — пройти тест на выбор профессии в Web3.</b>"
     )
 
 
 def bonus_keyboard() -> InlineKeyboardMarkup:
     rows = []
+    if PROF_TEST_URL:
+        rows.append([InlineKeyboardButton("🎯 Выбрать профессию в Web3", url=PROF_TEST_URL)])
     bonus_row = []
     if BONUS_TEXT_URL:
-        bonus_row.append(InlineKeyboardButton("🎁 Бонус: текст", url=BONUS_TEXT_URL))
+        bonus_row.append(InlineKeyboardButton(f"🎁 {BONUS_TITLE}", url=BONUS_TEXT_URL))
     if BONUS_VIDEO_URL:
-        bonus_row.append(InlineKeyboardButton("🎥 Бонус: видео", url=BONUS_VIDEO_URL))
+        bonus_row.append(InlineKeyboardButton("🎥 Видео к бонусу", url=BONUS_VIDEO_URL))
     if bonus_row:
         rows.append(bonus_row)
     extra_row = []
@@ -449,9 +462,11 @@ def progress_text(user: sqlite3.Row) -> str:
     else:
         lines.append("Курс: <b>в процессе</b>")
     if parse_dt(user["test_opened_at"]):
-        lines.append("Тест: <b>открыт</b>")
+        lines.append("Тест: <b>ссылка открыта</b>")
+    else:
+        lines.append("Следующий шаг: <b>пройти тест на профессию</b>")
     if parse_dt(user["bonus_opened_at"]):
-        lines.append("Бонус: <b>открыт</b>")
+        lines.append(f"Бонус: <b>открыт</b> — {BONUS_TITLE}")
     return "\n".join(lines)
 
 
@@ -486,6 +501,33 @@ async def safe_edit_or_send(
             parse_mode=parse_mode,
             disable_web_page_preview=True,
         )
+
+
+def is_admin_user(user_id: int) -> bool:
+    return bool(ADMIN_USER_IDS) and user_id in ADMIN_USER_IDS
+
+
+def stats_text() -> str:
+    with closing(get_connection()) as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        completed = conn.execute("SELECT COUNT(*) FROM users WHERE completed = 1").fetchone()[0]
+        bonus_opened = conn.execute("SELECT COUNT(*) FROM users WHERE bonus_opened_at IS NOT NULL AND bonus_opened_at != ''").fetchone()[0]
+        started = conn.execute("SELECT COUNT(DISTINCT user_id) FROM analytics_events WHERE event_type = 'start'").fetchone()[0]
+        lessons = []
+        for n in range(1, TOTAL_LESSONS + 1):
+            cnt = conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM analytics_events WHERE event_type = 'lesson_opened' AND lesson_number = ?",
+                (n,),
+            ).fetchone()[0]
+            lessons.append(f"Урок {n}: <b>{cnt}</b>")
+    return (
+        "📈 <b>Статистика бота</b>\n\n"
+        f"Пользователей в базе: <b>{total_users}</b>\n"
+        f"Нажали /start: <b>{started}</b>\n"
+        f"Завершили курс: <b>{completed}</b>\n"
+        f"Открыли бонус: <b>{bonus_opened}</b>\n\n"
+        "<b>Открытия уроков:</b>\n" + "\n".join(lessons)
+    )
 
 
 # ---------------------------
@@ -523,7 +565,7 @@ async def send_bonus_gate_result(update: Update, context: ContextTypes.DEFAULT_T
             await safe_edit_or_send(
                 update,
                 context,
-                "<b>Бонус пока не добавлен</b>\n\nСсылка на бонусный урок появится позже.",
+                f"<b>{BONUS_TITLE} пока не добавлен</b>\n\nСсылка на бонусный материал появится позже.",
                 final_keyboard(),
             )
         return
@@ -554,7 +596,7 @@ async def send_bonus_gate_result(update: Update, context: ContextTypes.DEFAULT_T
             await safe_edit_or_send(
                 update,
                 context,
-                "<b>Бонус пока не добавлен</b>\n\nСсылка на бонусный урок появится позже.",
+                f"<b>{BONUS_TITLE} пока не добавлен</b>\n\nСсылка на бонусный материал появится позже.",
                 final_keyboard(),
             )
         return
@@ -592,6 +634,7 @@ async def send_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not int(user["completed"] or 0):
         update_user_state(update.effective_user.id, current_lesson=TOTAL_LESSONS, max_lesson_opened=TOTAL_LESSONS, completed=1)
         log_event(update.effective_user.id, "course_completed", TOTAL_LESSONS)
+    log_event(update.effective_user.id, "final_shown", TOTAL_LESSONS)
     await safe_edit_or_send(update, context, final_text(), final_keyboard())
 
 
@@ -614,6 +657,15 @@ async def progress_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     row = get_user(user.id)
     if update.message:
         await update.message.reply_text(progress_text(row), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin_user(update.effective_user.id):
+        if update.message:
+            await update.message.reply_text("Команда недоступна.")
+        return
+    if update.message:
+        await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def continue_course(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -664,7 +716,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if data == "final":
-        update_user_state(update.effective_user.id, test_opened_at=now_iso())
         await send_final(update, context)
         return
 
@@ -695,15 +746,18 @@ def build_application() -> Application:
             "set" if lesson["text_url"] else "empty",
             "set" if lesson["video_url"] else "empty",
         )
+    logger.info("Bonus title | %s", BONUS_TITLE)
     logger.info("Bonus URLs | text=%s | video=%s", "set" if BONUS_TEXT_URL else "empty", "set" if BONUS_VIDEO_URL else "empty")
     logger.info("Community URL | %s", "set" if COMMUNITY_URL else "empty")
     logger.info("Channel URL | %s", "set" if CHANNEL_URL else "empty")
     logger.info("Bonus group chat for check | %s", BONUS_GROUP_CHAT if BONUS_GROUP_CHAT else "empty")
     logger.info("Bonus channel chat for check | %s", BONUS_CHANNEL_CHAT if BONUS_CHANNEL_CHAT else "empty")
+    logger.info("Admin stats enabled | %s", "yes" if ADMIN_USER_IDS else "no")
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_handler))
+    application.add_handler(CommandHandler("stats", stats_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, menu_text_handler))
     application.add_error_handler(error_handler)
