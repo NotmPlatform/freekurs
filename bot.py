@@ -64,7 +64,7 @@ BONUS_TEXT_URL = env_str("BONUS_TEXT_URL", "BONUS_LESSON_TEXT_URL")
 BONUS_VIDEO_URL = env_str("BONUS_VIDEO_URL", "BONUS_LESSON_VIDEO_URL")
 COMMUNITY_URL = env_str("COMMUNITY_URL", "GROUP_URL")
 CHANNEL_URL = env_str("CHANNEL_URL")
-BONUS_TITLE = env_str("BONUS_TITLE", default="Ваш карьерный навигатор по Web3")
+BONUS_TITLE = env_str("BONUS_TITLE", default="Карьерный навигатор")
 ADMIN_USER_IDS = {int(x) for x in env_str("ADMIN_USER_IDS").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}
 WEBHOOK_URL = env_str("WEBHOOK_URL").rstrip("/")
 WEBHOOK_PATH = env_str("WEBHOOK_PATH", default="webhook").strip("/") or "webhook"
