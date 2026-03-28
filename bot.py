@@ -76,6 +76,7 @@ PORT = int(env_str("PORT", default="8080"))
 # Бот должен быть добавлен туда администратором.
 VIDEO_SOURCE_CHAT = normalize_chat_ref(env_str("VIDEO_SOURCE_CHAT", default="-1003723306059"))
 VIDEO_POST_PREFIX = env_str("VIDEO_POST_PREFIX", default="web").strip().lower() or "web"
+AUTO_SEND_VIDEO_ON_LESSON_SWITCH = env_str("AUTO_SEND_VIDEO_ON_LESSON_SWITCH", default="1") not in {"0", "false", "False", "no", "NO"}
 
 # Chats used for bonus access verification.
 # Accepts numeric chat_id (-100...) or @username / public handle.
@@ -253,6 +254,16 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_ui_state (
+                    user_id INTEGER PRIMARY KEY,
+                    lesson_message_id INTEGER,
+                    video_message_id INTEGER,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_user_id ON analytics_events(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_type ON analytics_events(event_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_created_at ON analytics_events(created_at)")
@@ -352,6 +363,45 @@ def get_video_sync_rows() -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT lesson_number, post_key, message_id, updated_at FROM lesson_video_posts ORDER BY lesson_number"
         ).fetchall()
+
+
+
+def get_user_ui_state(user_id: int) -> Optional[sqlite3.Row]:
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT user_id, lesson_message_id, video_message_id, updated_at FROM user_ui_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def save_user_ui_state(
+    user_id: int,
+    *,
+    lesson_message_id: Optional[int] = None,
+    video_message_id: Optional[int] = None,
+) -> None:
+    existing = get_user_ui_state(user_id)
+    lesson_value = lesson_message_id if lesson_message_id is not None else (int(existing["lesson_message_id"]) if existing and existing["lesson_message_id"] is not None else None)
+    video_value = video_message_id if video_message_id is not None else (int(existing["video_message_id"]) if existing and existing["video_message_id"] is not None else None)
+    with closing(get_connection()) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO user_ui_state (user_id, lesson_message_id, video_message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    lesson_message_id = excluded.lesson_message_id,
+                    video_message_id = excluded.video_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, lesson_value, video_value, now_iso()),
+            )
+
+
+def clear_user_video_message_id(user_id: int) -> None:
+    existing = get_user_ui_state(user_id)
+    lesson_value = int(existing["lesson_message_id"]) if existing and existing["lesson_message_id"] is not None else None
+    save_user_ui_state(user_id, lesson_message_id=lesson_value, video_message_id=None)
 
 
 # ---------------------------
@@ -623,6 +673,46 @@ async def safe_edit_or_send(
         )
 
 
+
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int]) -> None:
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "message to delete not found" in msg or "message can't be deleted" in msg:
+            return
+        logger.exception("Failed to delete message %s in chat %s", message_id, chat_id)
+    except TelegramError:
+        logger.exception("Failed to delete message %s in chat %s", message_id, chat_id)
+
+
+async def delete_tracked_video_message(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_user_ui_state(user_id)
+    if not state or state["video_message_id"] is None:
+        return
+    await safe_delete_message(context, chat_id, int(state["video_message_id"]))
+    save_user_ui_state(
+        user_id,
+        lesson_message_id=int(state["lesson_message_id"]) if state["lesson_message_id"] is not None else None,
+        video_message_id=None,
+    )
+
+
+async def delete_tracked_lesson_and_video_messages(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_user_ui_state(user_id)
+    if not state:
+        return
+    lesson_message_id = int(state["lesson_message_id"]) if state["lesson_message_id"] is not None else None
+    video_message_id = int(state["video_message_id"]) if state["video_message_id"] is not None else None
+    if video_message_id:
+        await safe_delete_message(context, chat_id, video_message_id)
+    if lesson_message_id:
+        await safe_delete_message(context, chat_id, lesson_message_id)
+    save_user_ui_state(user_id, lesson_message_id=None, video_message_id=None)
+
+
 def is_admin_user(user_id: int) -> bool:
     return bool(ADMIN_USER_IDS) and user_id in ADMIN_USER_IDS
 
@@ -734,69 +824,112 @@ async def send_bonus_gate_result(update: Update, context: ContextTypes.DEFAULT_T
 # ---------------------------
 # Handlers
 # ---------------------------
-async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_number: int) -> None:
-    user = get_user(update.effective_user.id)
+async def send_lesson(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lesson_number: int,
+    *,
+    auto_send_video: bool = False,
+) -> None:
+    user_id = update.effective_user.id
+    user = get_user(user_id)
     if not user:
-        upsert_user(update.effective_user.id, update.effective_user.username or "", update.effective_user.first_name or "")
-        user = get_user(update.effective_user.id)
+        upsert_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
+        user = get_user(user_id)
+
     max_opened = max(int(user["max_lesson_opened"] or 1), lesson_number)
     completed = 1 if lesson_number == TOTAL_LESSONS and int(user["completed"] or 0) else int(user["completed"] or 0)
-    update_user_state(update.effective_user.id, current_lesson=lesson_number, max_lesson_opened=max_opened, completed=completed)
-    log_event(update.effective_user.id, "lesson_opened", lesson_number)
-    await safe_edit_or_send(update, context, build_lesson_text(lesson_number), lesson_keyboard(lesson_number))
+    update_user_state(user_id, current_lesson=lesson_number, max_lesson_opened=max_opened, completed=completed)
+    log_event(user_id, "lesson_opened", lesson_number)
 
-
-async def send_lesson_video(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_number: int) -> None:
+    chat_id = update.effective_chat.id
     query = update.callback_query
-    row = get_lesson_video_post(lesson_number)
 
-    if not row:
-        if query:
-            await query.answer("Видео пока не найдено", show_alert=False)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"Видео для урока {lesson_number} пока не подключено.\n\n"
-                f"Что проверить:\n"
-                f"• бот добавлен администратором в канал {VIDEO_SOURCE_CHAT};\n"
-                f"• в канале есть пост с видео и подписью <code>{expected_video_key(lesson_number)}</code>;\n"
-                f"• этот пост был отправлен или отредактирован уже после добавления бота."
-            ),
+    if query and query.message:
+        await delete_tracked_video_message(user_id, chat_id, context)
+        await safe_edit_or_send(update, context, build_lesson_text(lesson_number), lesson_keyboard(lesson_number))
+        save_user_ui_state(user_id, lesson_message_id=query.message.message_id, video_message_id=None)
+    else:
+        await delete_tracked_lesson_and_video_messages(user_id, chat_id, context)
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text=build_lesson_text(lesson_number),
+            reply_markup=lesson_keyboard(lesson_number),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        save_user_ui_state(user_id, lesson_message_id=sent.message_id, video_message_id=None)
+
+    if auto_send_video:
+        await send_lesson_video(update, context, lesson_number, silent=True)
+
+
+async def send_lesson_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lesson_number: int,
+    *,
+    silent: bool = False,
+) -> None:
+    query = update.callback_query
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    row = get_lesson_video_post(lesson_number)
+
+    if not row:
+        if query and not silent:
+            await query.answer("Видео пока не найдено", show_alert=False)
+        if not silent:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"Видео для урока {lesson_number} пока не подключено.\n\n"
+                    f"Что проверить:\n"
+                    f"• бот добавлен администратором в канал {VIDEO_SOURCE_CHAT};\n"
+                    f"• в канале есть пост с видео и подписью <code>{expected_video_key(lesson_number)}</code>;\n"
+                    f"• этот пост был отправлен или отредактирован уже после добавления бота."
+                ),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         return
 
+    await delete_tracked_video_message(user_id, chat_id, context)
+
     try:
-        await context.bot.copy_message(
-            chat_id=update.effective_chat.id,
+        sent_video = await context.bot.copy_message(
+            chat_id=chat_id,
             from_chat_id=VIDEO_SOURCE_CHAT,
             message_id=int(row["message_id"]),
             caption=video_caption_for_lesson(lesson_number),
             parse_mode=ParseMode.HTML,
         )
+        state = get_user_ui_state(user_id)
+        lesson_message_id = int(state["lesson_message_id"]) if state and state["lesson_message_id"] is not None else None
+        save_user_ui_state(user_id, lesson_message_id=lesson_message_id, video_message_id=sent_video.message_id)
         log_event(
-            update.effective_user.id,
+            user_id,
             "lesson_video_sent",
             lesson_number,
             f"channel_message_id={row['message_id']}",
         )
-        if query:
+        if query and not silent:
             await query.answer("Видео отправлено")
     except TelegramError:
         logger.exception("Failed to copy video for lesson %s from source channel", lesson_number)
-        if query:
+        if query and not silent:
             await query.answer("Не удалось отправить видео", show_alert=False)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                "Не удалось отправить видео из закрытого канала.\n\n"
-                "Проверь, что:\n"
-                "• бот всё ещё администратор канала;\n"
-                "• пост не удалён;\n"
-                "• подпись соответствует формату web1, web2 и так далее."
-            ),
-        )
+        if not silent:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Не удалось отправить видео из закрытого канала.\n\n"
+                    "Проверь, что:\n"
+                    "• бот всё ещё администратор канала;\n"
+                    "• пост не удалён;\n"
+                    "• подпись соответствует формату web1, web2 и так далее."
+                ),
+            )
 
 
 async def handle_video_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -829,15 +962,32 @@ async def handle_video_source_post(update: Update, context: ContextTypes.DEFAULT
 
 
 async def send_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = get_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    user = get_user(user_id)
     if not user:
-        upsert_user(update.effective_user.id, update.effective_user.username or "", update.effective_user.first_name or "")
-        user = get_user(update.effective_user.id)
+        upsert_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
+        user = get_user(user_id)
     if not int(user["completed"] or 0):
-        update_user_state(update.effective_user.id, current_lesson=TOTAL_LESSONS, max_lesson_opened=TOTAL_LESSONS, completed=1)
-        log_event(update.effective_user.id, "course_completed", TOTAL_LESSONS)
-    log_event(update.effective_user.id, "final_shown", TOTAL_LESSONS)
-    await safe_edit_or_send(update, context, final_text(), final_keyboard())
+        update_user_state(user_id, current_lesson=TOTAL_LESSONS, max_lesson_opened=TOTAL_LESSONS, completed=1)
+        log_event(user_id, "course_completed", TOTAL_LESSONS)
+
+    await delete_tracked_video_message(user_id, update.effective_chat.id, context)
+    log_event(user_id, "final_shown", TOTAL_LESSONS)
+
+    query = update.callback_query
+    if query and query.message:
+        await safe_edit_or_send(update, context, final_text(), final_keyboard())
+        save_user_ui_state(user_id, lesson_message_id=query.message.message_id, video_message_id=None)
+    else:
+        await delete_tracked_lesson_and_video_messages(user_id, update.effective_chat.id, context)
+        sent = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=final_text(),
+            reply_markup=final_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        save_user_ui_state(user_id, lesson_message_id=sent.message_id, video_message_id=None)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -929,7 +1079,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data.startswith("lesson:"):
         lesson_number = int(data.split(":", 1)[1])
         lesson_number = max(1, min(TOTAL_LESSONS, lesson_number))
-        await send_lesson(update, context, lesson_number)
+        await send_lesson(update, context, lesson_number, auto_send_video=AUTO_SEND_VIDEO_ON_LESSON_SWITCH)
         return
 
     if data == "final":
@@ -965,6 +1115,7 @@ def build_application() -> Application:
         )
     logger.info("Video source chat | %s", VIDEO_SOURCE_CHAT if VIDEO_SOURCE_CHAT else "empty")
     logger.info("Video post prefix | %s", VIDEO_POST_PREFIX)
+    logger.info("Auto send video on lesson switch | %s", "yes" if AUTO_SEND_VIDEO_ON_LESSON_SWITCH else "no")
     logger.info("Bonus title | %s", BONUS_TITLE)
     logger.info("Bonus URLs | text=%s | video=%s", "set" if BONUS_TEXT_URL else "empty", "set" if BONUS_VIDEO_URL else "empty")
     logger.info("Community URL | %s", "set" if COMMUNITY_URL else "empty")
