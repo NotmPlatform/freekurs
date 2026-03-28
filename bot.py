@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -70,6 +71,11 @@ WEBHOOK_URL = env_str("WEBHOOK_URL").rstrip("/")
 WEBHOOK_PATH = env_str("WEBHOOK_PATH", default="webhook").strip("/") or "webhook"
 WEBHOOK_SECRET = env_str("WEBHOOK_SECRET")
 PORT = int(env_str("PORT", default="8080"))
+
+# Закрытый канал с видеоуроками.
+# Бот должен быть добавлен туда администратором.
+VIDEO_SOURCE_CHAT = normalize_chat_ref(env_str("VIDEO_SOURCE_CHAT", default="-1003723306059"))
+VIDEO_POST_PREFIX = env_str("VIDEO_POST_PREFIX", default="web").strip().lower() or "web"
 
 # Chats used for bonus access verification.
 # Accepts numeric chat_id (-100...) or @username / public handle.
@@ -237,6 +243,16 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lesson_video_posts (
+                    lesson_number INTEGER PRIMARY KEY,
+                    post_key TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_user_id ON analytics_events(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_type ON analytics_events(event_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_analytics_created_at ON analytics_events(created_at)")
@@ -307,6 +323,106 @@ def update_user_state(
             conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?", values)
 
 
+def save_lesson_video_post(lesson_number: int, post_key: str, message_id: int) -> None:
+    with closing(get_connection()) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO lesson_video_posts (lesson_number, post_key, message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(lesson_number) DO UPDATE SET
+                    post_key = excluded.post_key,
+                    message_id = excluded.message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (lesson_number, post_key, message_id, now_iso()),
+            )
+
+
+def get_lesson_video_post(lesson_number: int) -> Optional[sqlite3.Row]:
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT lesson_number, post_key, message_id, updated_at FROM lesson_video_posts WHERE lesson_number = ?",
+            (lesson_number,),
+        ).fetchone()
+
+
+def get_video_sync_rows() -> list[sqlite3.Row]:
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT lesson_number, post_key, message_id, updated_at FROM lesson_video_posts ORDER BY lesson_number"
+        ).fetchall()
+
+
+# ---------------------------
+# Video mapping helpers
+# ---------------------------
+
+def expected_video_key(lesson_number: int) -> str:
+    return f"{VIDEO_POST_PREFIX}{lesson_number}"
+
+
+def normalize_key_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def extract_video_key_from_message(message) -> Optional[str]:
+    source_text = message.caption or message.text or ""
+    normalized = normalize_key_text(source_text)
+    if not normalized:
+        return None
+
+    pattern = rf"\b{re.escape(VIDEO_POST_PREFIX)}\s*(\d+)\b"
+    match = re.search(pattern, normalized)
+    if not match:
+        return None
+
+    lesson_number = int(match.group(1))
+    if 1 <= lesson_number <= TOTAL_LESSONS:
+        return expected_video_key(lesson_number)
+    return None
+
+
+def lesson_number_from_video_key(post_key: str) -> Optional[int]:
+    pattern = rf"^{re.escape(VIDEO_POST_PREFIX)}(\d+)$"
+    match = re.match(pattern, normalize_key_text(post_key).replace(" ", ""))
+    if not match:
+        return None
+    lesson_number = int(match.group(1))
+    if 1 <= lesson_number <= TOTAL_LESSONS:
+        return lesson_number
+    return None
+
+
+def has_supported_video_media(message) -> bool:
+    return bool(message.video or message.document or message.animation or message.video_note)
+
+
+def video_caption_for_lesson(lesson_number: int) -> str:
+    lesson = get_lesson(lesson_number)
+    return (
+        f"🎬 <b>Видео урок {lesson_number} из {TOTAL_LESSONS}</b>\n"
+        f"<b>{lesson['title']}</b>"
+    )
+
+
+def video_sync_text() -> str:
+    rows = {int(row["lesson_number"]): row for row in get_video_sync_rows()}
+    lines = [
+        "🎬 <b>Синхронизация видеоуроков</b>",
+        "",
+        f"Канал-источник: <code>{VIDEO_SOURCE_CHAT}</code>",
+        "",
+    ]
+    for n in range(1, TOTAL_LESSONS + 1):
+        row = rows.get(n)
+        if row:
+            lines.append(f"Урок {n}: <b>подключён</b> — {row['post_key']} → message_id {row['message_id']}")
+        else:
+            lines.append(f"Урок {n}: <b>не найден</b> — ожидается подпись <code>{expected_video_key(n)}</code>")
+    return "\n".join(lines)
+
+
 # ---------------------------
 # Presentation helpers
 # ---------------------------
@@ -319,7 +435,7 @@ def build_lesson_text(lesson_number: int) -> str:
     lesson = get_lesson(lesson_number)
     bullets = "\n".join(f"• {item}" for item in lesson["bullets"])
     extra = ""
-    if not lesson.get("text_url") and not lesson.get("video_url"):
+    if not lesson.get("text_url") and not lesson.get("video_url") and not VIDEO_SOURCE_CHAT:
         extra = "\n\n<i>Материал этого урока скоро будет добавлен.</i>"
     return (
         f"<b>Урок {lesson_number} из {TOTAL_LESSONS}</b>\n"
@@ -336,8 +452,12 @@ def lesson_keyboard(lesson_number: int) -> InlineKeyboardMarkup:
     format_row = []
     if lesson.get("text_url"):
         format_row.append(InlineKeyboardButton("📖 Текстовый урок", url=lesson["text_url"]))
-    if lesson.get("video_url"):
+
+    if VIDEO_SOURCE_CHAT:
+        format_row.append(InlineKeyboardButton("🎬 Видео урок", callback_data=f"video:{lesson_number}"))
+    elif lesson.get("video_url"):
         format_row.append(InlineKeyboardButton("🎬 Видео урок", url=lesson["video_url"]))
+
     if format_row:
         rows.append(format_row)
 
@@ -626,6 +746,88 @@ async def send_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson
     await safe_edit_or_send(update, context, build_lesson_text(lesson_number), lesson_keyboard(lesson_number))
 
 
+async def send_lesson_video(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_number: int) -> None:
+    query = update.callback_query
+    row = get_lesson_video_post(lesson_number)
+
+    if not row:
+        if query:
+            await query.answer("Видео пока не найдено", show_alert=False)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"Видео для урока {lesson_number} пока не подключено.\n\n"
+                f"Что проверить:\n"
+                f"• бот добавлен администратором в канал {VIDEO_SOURCE_CHAT};\n"
+                f"• в канале есть пост с видео и подписью <code>{expected_video_key(lesson_number)}</code>;\n"
+                f"• этот пост был отправлен или отредактирован уже после добавления бота."
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=VIDEO_SOURCE_CHAT,
+            message_id=int(row["message_id"]),
+            caption=video_caption_for_lesson(lesson_number),
+            parse_mode=ParseMode.HTML,
+        )
+        log_event(
+            update.effective_user.id,
+            "lesson_video_sent",
+            lesson_number,
+            f"channel_message_id={row['message_id']}",
+        )
+        if query:
+            await query.answer("Видео отправлено")
+    except TelegramError:
+        logger.exception("Failed to copy video for lesson %s from source channel", lesson_number)
+        if query:
+            await query.answer("Не удалось отправить видео", show_alert=False)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "Не удалось отправить видео из закрытого канала.\n\n"
+                "Проверь, что:\n"
+                "• бот всё ещё администратор канала;\n"
+                "• пост не удалён;\n"
+                "• подпись соответствует формату web1, web2 и так далее."
+            ),
+        )
+
+
+async def handle_video_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.channel_post or update.edited_channel_post
+    if not message:
+        return
+    if VIDEO_SOURCE_CHAT is None or message.chat_id != VIDEO_SOURCE_CHAT:
+        return
+    if not has_supported_video_media(message):
+        return
+
+    post_key = extract_video_key_from_message(message)
+    if not post_key:
+        logger.info("Channel post %s ignored: no valid webN key found", message.message_id)
+        return
+
+    lesson_number = lesson_number_from_video_key(post_key)
+    if lesson_number is None:
+        logger.info("Channel post %s ignored: invalid lesson number in key %s", message.message_id, post_key)
+        return
+
+    save_lesson_video_post(lesson_number, post_key, message.message_id)
+    logger.info(
+        "Synced video lesson %s from channel %s: key=%s, message_id=%s",
+        lesson_number,
+        VIDEO_SOURCE_CHAT,
+        post_key,
+        message.message_id,
+    )
+
+
 async def send_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = get_user(update.effective_user.id)
     if not user:
@@ -668,6 +870,15 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+async def video_sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin_user(update.effective_user.id):
+        if update.message:
+            await update.message.reply_text("Команда недоступна.")
+        return
+    if update.message:
+        await update.message.reply_text(video_sync_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 async def continue_course(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     upsert_user(user.id, user.username or "", user.first_name or "")
@@ -705,6 +916,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "bonus:check":
         await query.answer("Проверяю подписку...")
         await send_bonus_gate_result(update, context)
+        return
+
+    if data.startswith("video:"):
+        lesson_number = int(data.split(":", 1)[1])
+        lesson_number = max(1, min(TOTAL_LESSONS, lesson_number))
+        await send_lesson_video(update, context, lesson_number)
         return
 
     await query.answer()
@@ -746,6 +963,8 @@ def build_application() -> Application:
             "set" if lesson["text_url"] else "empty",
             "set" if lesson["video_url"] else "empty",
         )
+    logger.info("Video source chat | %s", VIDEO_SOURCE_CHAT if VIDEO_SOURCE_CHAT else "empty")
+    logger.info("Video post prefix | %s", VIDEO_POST_PREFIX)
     logger.info("Bonus title | %s", BONUS_TITLE)
     logger.info("Bonus URLs | text=%s | video=%s", "set" if BONUS_TEXT_URL else "empty", "set" if BONUS_VIDEO_URL else "empty")
     logger.info("Community URL | %s", "set" if COMMUNITY_URL else "empty")
@@ -758,6 +977,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_handler))
     application.add_handler(CommandHandler("stats", stats_handler))
+    application.add_handler(CommandHandler("videosync", video_sync_handler))
+    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_video_source_post))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, menu_text_handler))
     application.add_error_handler(error_handler)
@@ -773,6 +994,8 @@ def main() -> None:
     app = build_application()
     app.post_init = post_init
 
+    allowed_updates = ["message", "callback_query", "channel_post", "edited_channel_post"]
+
     if WEBHOOK_URL:
         webhook_path = f"/{WEBHOOK_PATH}"
         logger.info("Starting bot with webhook on %s%s", WEBHOOK_URL, webhook_path)
@@ -782,12 +1005,12 @@ def main() -> None:
             url_path=WEBHOOK_PATH,
             webhook_url=f"{WEBHOOK_URL}{webhook_path}",
             secret_token=WEBHOOK_SECRET or None,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=allowed_updates,
             drop_pending_updates=True,
         )
     else:
         logger.info("Starting bot with polling")
-        app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+        app.run_polling(allowed_updates=allowed_updates, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
