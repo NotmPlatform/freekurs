@@ -62,7 +62,6 @@ BOT_TOKEN = env_str("BOT_TOKEN")
 DB_PATH = env_str("DB_PATH", default=os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".") + "/web3_course_clean.db")
 PROF_TEST_URL = env_str("PROF_TEST_URL", "TEST_URL", default="https://t.me/Web3UPbot")
 BONUS_TEXT_URL = env_str("BONUS_TEXT_URL", "BONUS_LESSON_TEXT_URL")
-BONUS_VIDEO_URL = env_str("BONUS_VIDEO_URL", "BONUS_LESSON_VIDEO_URL")
 COMMUNITY_URL = env_str("COMMUNITY_URL", "GROUP_URL")
 CHANNEL_URL = env_str("CHANNEL_URL")
 BONUS_TITLE = env_str("BONUS_TITLE", default="Навигатор Web3")
@@ -597,13 +596,8 @@ def bonus_keyboard() -> InlineKeyboardMarkup:
     rows = []
     if PROF_TEST_URL:
         rows.append([InlineKeyboardButton("🎯 Выбрать профессию в Web3", url=PROF_TEST_URL)])
-    bonus_row = []
     if BONUS_TEXT_URL:
-        bonus_row.append(InlineKeyboardButton(f"🎁 {BONUS_TITLE}", url=BONUS_TEXT_URL))
-    if BONUS_VIDEO_URL:
-        bonus_row.append(InlineKeyboardButton("🎥 Видео к бонусу", url=BONUS_VIDEO_URL))
-    if bonus_row:
-        rows.append(bonus_row)
+        rows.append([InlineKeyboardButton(f"🎁 {BONUS_TITLE}", url=BONUS_TEXT_URL)])
     extra_row = []
     if COMMUNITY_URL:
         extra_row.append(InlineKeyboardButton("💬 Группа", url=COMMUNITY_URL))
@@ -767,7 +761,7 @@ async def send_bonus_gate_result(update: Update, context: ContextTypes.DEFAULT_T
 
     # If no checks configured, open bonus directly.
     if not BONUS_GROUP_CHAT and not BONUS_CHANNEL_CHAT:
-        if BONUS_TEXT_URL or BONUS_VIDEO_URL:
+        if BONUS_TEXT_URL:
             update_user_state(user_id, bonus_opened_at=now_iso())
             log_event(user_id, "bonus_opened", TOTAL_LESSONS, "checks_disabled")
             await safe_edit_or_send(update, context, bonus_text(), bonus_keyboard())
@@ -798,7 +792,7 @@ async def send_bonus_gate_result(update: Update, context: ContextTypes.DEFAULT_T
     missing_group = not bool(group_ok)
 
     if not missing_channel and not missing_group:
-        if BONUS_TEXT_URL or BONUS_VIDEO_URL:
+        if BONUS_TEXT_URL:
             update_user_state(user_id, bonus_opened_at=now_iso())
             log_event(user_id, "bonus_opened", TOTAL_LESSONS, "subscription_verified")
             await safe_edit_or_send(update, context, bonus_text(), bonus_keyboard())
@@ -1117,7 +1111,7 @@ def build_application() -> Application:
     logger.info("Video post prefix | %s", VIDEO_POST_PREFIX)
     logger.info("Auto send video on lesson switch | %s", "yes" if AUTO_SEND_VIDEO_ON_LESSON_SWITCH else "no")
     logger.info("Bonus title | %s", BONUS_TITLE)
-    logger.info("Bonus URLs | text=%s | video=%s", "set" if BONUS_TEXT_URL else "empty", "set" if BONUS_VIDEO_URL else "empty")
+    logger.info("Bonus text URL | %s", "set" if BONUS_TEXT_URL else "empty")
     logger.info("Community URL | %s", "set" if COMMUNITY_URL else "empty")
     logger.info("Channel URL | %s", "set" if CHANNEL_URL else "empty")
     logger.info("Bonus group chat for check | %s", BONUS_GROUP_CHAT if BONUS_GROUP_CHAT else "empty")
